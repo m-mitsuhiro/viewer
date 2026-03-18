@@ -1,0 +1,54 @@
+[package]
+name = "viewer"
+version = "0.1.0"
+description = "A local image and video viewer"
+authors = []
+edition = "2021"
+
+[lib]
+name = "viewer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Image processing
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "rayon"] }
+base64 = "0.22"
+
+# EXIF
+kamadak-exif = "0.5"
+
+# SQLite
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# File system
+walkdir = "2"
+dirs = "5"
+
+# Trash (Windows Recycle Bin)
+trash = "5"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
