@@ -1,13 +1,11 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store";
-import { useFileUrl } from "../../hooks/useFileUrl";
 import { commands } from "../../lib/tauri";
+import ParallaxViewer from "../ParallaxViewer";
 
-// ─── Types / constants ────────────────────────────────────────────────
 type Transform = { scale: number; x: number; y: number; rotate: number; flipX: boolean; flipY: boolean };
 const DEFAULT_TRANSFORM: Transform = { scale: 1, x: 0, y: 0, rotate: 0, flipX: false, flipY: false };
-const SLIDE_MS = 280;
 
 function getMimeType(path: string) {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -18,7 +16,7 @@ function getMimeType(path: string) {
   return map[ext] ?? "image/jpeg";
 }
 
-// ─── Ken Burns (slideshow) ────────────────────────────────────────────
+// ── Ken Burns ────────────────────────────────────────────────────────
 const KB_MOVES: [Keyframe, Keyframe][] = [
   [{ transform: "scale(1.0) translate(0%,   0%)"  }, { transform: "scale(1.2) translate(-4%, -4%)" }],
   [{ transform: "scale(1.2) translate(4%,   4%)"  }, { transform: "scale(1.0) translate(-4%, -4%)" }],
@@ -30,19 +28,50 @@ const KB_MOVES: [Keyframe, Keyframe][] = [
   [{ transform: "scale(1.15) translate(0%,  0%)"  }, { transform: "scale(1.0) translate( 3%,  3%)" }],
 ];
 
-// ─────────────────────────────────────────────────────────────────────
+// ── Slide durations ──────────────────────────────────────────────────
+const SLIDE_DURATION = 280; // ms
+
 export default function Viewer() {
   const {
     selectedFile, selectNext, selectPrev, closeViewer,
     isFullscreen, setFullscreen, setCurrentMetadata, toggleInfoPanel,
-    slideshowActive, slideshowInterval,
+    slideshowActive, slideshowInterval, slideDirection,
   } = useAppStore();
 
-  // ── Manual transform (zoom / pan / rotate) ─────────────────────────
+  // ── Parallax viewer ──────────────────────────────────────────────
+  const [showParallax, setShowParallax] = useState(false);
+
+  // ── Manual transform (zoom / pan / rotate) ───────────────────────
   const [transform, setTransform] = useState<Transform>(DEFAULT_TRANSFORM);
   const [isDragging, setIsDragging] = useState(false);
   const dragStart = useRef<{ mx: number; my: number; tx: number; ty: number } | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
+  // ── Shared URL state (both slideshow and normal viewer) ──────────
+  const [currentUrl, setCurrentUrl]   = useState<string | null>(null);
+  const [prevUrl,    setPrevUrl]       = useState<string | null>(null);
+  const currUrlRef = useRef<string | null>(null);
+  const prevUrlRef = useRef<string | null>(null);
+  const prevTimer  = useRef<number | null>(null);
+
+  // ── Slideshow Ken Burns ──────────────────────────────────────────
+  const kbMoveRef       = useRef<[Keyframe, Keyframe]>(KB_MOVES[0]);
+  const kbExitTransform = useRef<string>("none");
+  const kbAnimRef       = useRef<Animation | null>(null);
+
+  // ── Normal-viewer slide ──────────────────────────────────────────
+  const [isSliding, setIsSliding]     = useState(false);
+  const slideDir       = useRef<"prev" | "next">("next"); // captured at load time
+  const cssTransformRef = useRef<string>("");             // kept in sync for exit capture
+
+  // ── DOM refs ─────────────────────────────────────────────────────
+  const imgRef             = useRef<HTMLImageElement>(null);
+  const prevLayerRef       = useRef<HTMLDivElement>(null);
+  const slideInWrapperRef  = useRef<HTMLDivElement>(null); // slide target (not the img)
+
+  // ─────────────────────────────────────────────────────────────────
+  // Compute cssTransform string (used for manual viewer transform)
+  // ─────────────────────────────────────────────────────────────────
   const cssTransform = [
     `translate(${transform.x}px, ${transform.y}px)`,
     `scale(${transform.scale})`,
@@ -51,110 +80,150 @@ export default function Viewer() {
     `scaleY(${transform.flipY ? -1 : 1})`,
   ].join(" ");
 
-  // ── Normal viewer: single URL via hook ─────────────────────────────
-  const currentUrl = useFileUrl(slideshowActive ? null : selectedFile?.path);
+  useEffect(() => { cssTransformRef.current = cssTransform; }, [cssTransform]);
 
-  // ── Slide animation on URL change ──────────────────────────────────
-  const containerRef = useRef<HTMLDivElement>(null);
-  const wrapperRef   = useRef<HTMLDivElement>(null);
-  const prevUrlRef   = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (!currentUrl || !wrapperRef.current || !containerRef.current) return;
-    if (!prevUrlRef.current) {
-      // First load — no animation
-      prevUrlRef.current = currentUrl;
-      return;
-    }
-    prevUrlRef.current = currentUrl;
-    const cw  = containerRef.current.offsetWidth;
-    const dir = useAppStore.getState().slideDirection;
-    const fromX = dir === "next" ? cw : -cw;
-    wrapperRef.current.animate(
-      [{ transform: `translateX(${fromX}px)` }, { transform: "translateX(0px)" }],
-      { duration: SLIDE_MS, easing: "ease-out", fill: "forwards" },
-    );
-  }, [currentUrl]);
-
-  // ── Reset transform on file change ────────────────────────────────
+  // Reset manual transform when file changes
   useEffect(() => { setTransform(DEFAULT_TRANSFORM); }, [selectedFile?.path]);
 
-  // ── Slideshow URL state ────────────────────────────────────────────
-  const [sfCurrentUrl, setSfCurrentUrl] = useState<string | null>(null);
-  const [sfPrevUrl, setSfPrevUrl]       = useState<string | null>(null);
-  const sfCurrRef      = useRef<string | null>(null);
-  const sfPrevRef      = useRef<string | null>(null);
-  const prevFadeTimer  = useRef<number | null>(null);
-  const kbMoveRef      = useRef<[Keyframe, Keyframe]>(KB_MOVES[0]);
-  const kbExitTransform = useRef<string>("none");
-  const kbAnimRef      = useRef<Animation | null>(null);
-  const sfImgRef       = useRef<HTMLImageElement>(null);
-  const sfPrevLayerRef = useRef<HTMLDivElement>(null);
-
-  // ── Slideshow URL loading + Ken Burns ─────────────────────────────
+  // ─────────────────────────────────────────────────────────────────
+  // Load image URL (handles both slideshow and normal viewer)
+  // ─────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!slideshowActive || !selectedFile) return;
+    if (!selectedFile) return;
     let cancelled = false;
 
     readFile(selectedFile.path)
-      .then(data => {
+      .then((data) => {
         if (cancelled) return;
-        const newUrl = URL.createObjectURL(new Blob([data], { type: getMimeType(selectedFile.path) }));
+        const newUrl = URL.createObjectURL(
+          new Blob([data], { type: getMimeType(selectedFile.path) })
+        );
 
-        if (prevFadeTimer.current !== null) { clearTimeout(prevFadeTimer.current); prevFadeTimer.current = null; }
-        if (sfPrevRef.current) URL.revokeObjectURL(sfPrevRef.current);
+        // Clear pending prev cleanup
+        if (prevTimer.current !== null) { clearTimeout(prevTimer.current); prevTimer.current = null; }
 
-        if (sfImgRef.current) kbExitTransform.current = window.getComputedStyle(sfImgRef.current).transform;
-        kbMoveRef.current = KB_MOVES[Math.floor(Math.random() * KB_MOVES.length)];
+        // Revoke old prev immediately
+        if (prevUrlRef.current) { URL.revokeObjectURL(prevUrlRef.current); }
 
-        sfPrevRef.current = sfCurrRef.current;
-        sfCurrRef.current = newUrl;
-        setSfPrevUrl(sfPrevRef.current);
-        setSfCurrentUrl(newUrl);
+        if (slideshowActive) {
+          // Ken Burns: capture exit transform and pre-select next move
+          if (imgRef.current) kbExitTransform.current = window.getComputedStyle(imgRef.current).transform;
+          kbMoveRef.current = KB_MOVES[Math.floor(Math.random() * KB_MOVES.length)];
+        } else {
+          // Normal viewer: capture current direction
+          slideDir.current = slideDirection;
+        }
 
-        prevFadeTimer.current = window.setTimeout(() => {
-          if (sfPrevRef.current) { URL.revokeObjectURL(sfPrevRef.current); sfPrevRef.current = null; }
-          setSfPrevUrl(null);
-          prevFadeTimer.current = null;
-        }, 1100);
-      }).catch(console.error);
+        prevUrlRef.current = currUrlRef.current;
+        currUrlRef.current = newUrl;
+
+        const hasPrev = !!prevUrlRef.current;
+        setPrevUrl(prevUrlRef.current);
+        setCurrentUrl(newUrl);
+        if (!slideshowActive) setIsSliding(hasPrev);
+
+        // Schedule prev URL cleanup
+        prevTimer.current = window.setTimeout(() => {
+          if (prevUrlRef.current) { URL.revokeObjectURL(prevUrlRef.current); prevUrlRef.current = null; }
+          setPrevUrl(null);
+          prevTimer.current = null;
+        }, slideshowActive ? 1100 : SLIDE_DURATION + 500);
+      })
+      .catch(console.error);
 
     return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedFile?.path, slideshowActive]);
 
-  useEffect(() => {
-    if (!slideshowActive) {
-      kbAnimRef.current?.cancel();
-      if (prevFadeTimer.current !== null) { clearTimeout(prevFadeTimer.current); prevFadeTimer.current = null; }
-    }
-  }, [slideshowActive]);
-
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (prevFadeTimer.current !== null) clearTimeout(prevFadeTimer.current);
-      if (sfCurrRef.current) URL.revokeObjectURL(sfCurrRef.current);
-      if (sfPrevRef.current) URL.revokeObjectURL(sfPrevRef.current);
+      if (prevTimer.current !== null) clearTimeout(prevTimer.current);
+      if (currUrlRef.current) URL.revokeObjectURL(currUrlRef.current);
+      if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current);
     };
   }, []);
 
+  // Cleanup when leaving slideshow
   useEffect(() => {
-    if (!slideshowActive || !sfImgRef.current || !sfCurrentUrl) return;
+    if (!slideshowActive) {
+      kbAnimRef.current?.cancel();
+      setIsSliding(false);
+    }
+  }, [slideshowActive]);
+
+  // ─────────────────────────────────────────────────────────────────
+  // Ken Burns animation (slideshow only)
+  // ─────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!slideshowActive || !imgRef.current || !currentUrl) return;
     kbAnimRef.current?.cancel();
     const [from, to] = kbMoveRef.current;
-    kbAnimRef.current = sfImgRef.current.animate([from, to], {
-      duration: slideshowInterval * 1000, easing: "ease-in-out", fill: "forwards",
+    kbAnimRef.current = imgRef.current.animate([from, to], {
+      duration: slideshowInterval * 1000,
+      easing: "ease-in-out",
+      fill: "forwards",
     });
     return () => { kbAnimRef.current?.cancel(); };
-  }, [sfCurrentUrl, slideshowActive, slideshowInterval]);
+  }, [currentUrl, slideshowActive, slideshowInterval]);
 
+  // Fade-out animation for previous layer (slideshow)
   useEffect(() => {
-    if (!slideshowActive || !sfPrevUrl || !sfPrevLayerRef.current) return;
-    const anim = sfPrevLayerRef.current.animate(
+    if (!slideshowActive || !prevUrl || !prevLayerRef.current) return;
+    const anim = prevLayerRef.current.animate(
       [{ opacity: "1" }, { opacity: "0" }],
-      { duration: 900, easing: "ease-in-out", fill: "forwards" },
+      { duration: 900, easing: "ease-in-out", fill: "forwards" }
     );
     return () => anim.cancel();
-  }, [sfPrevUrl, slideshowActive]);
+  }, [prevUrl, slideshowActive]);
+
+  // ─────────────────────────────────────────────────────────────────
+  // Slide-in animation (useLayoutEffect で paint 前に開始 → 確実に動作)
+  // ─────────────────────────────────────────────────────────────────
+  useLayoutEffect(() => {
+    if (slideshowActive || !isSliding || !currentUrl || !slideInWrapperRef.current) return;
+    const el = slideInWrapperRef.current;
+    const fromX = slideDir.current === "next" ? "100%" : "-100%";
+
+    // 開始位置をトランジションなしで設定
+    el.style.transition = "none";
+    el.style.transform = `translateX(${fromX})`;
+    // リフロー強制 → ブラウザが開始位置をコミット
+    void el.offsetWidth;
+    // トランジション開始
+    el.style.transition = `transform ${SLIDE_DURATION}ms ease-out`;
+    el.style.transform = "translateX(0)";
+
+    const done = () => setIsSliding(false);
+    el.addEventListener("transitionend", done, { once: true });
+    return () => {
+      el.removeEventListener("transitionend", done);
+      el.style.transition = "";
+      el.style.transform = "";
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUrl, isSliding, slideshowActive]);
+
+  // Slide-out animation for outgoing image (normal viewer)
+  useLayoutEffect(() => {
+    if (slideshowActive || !prevUrl || !prevLayerRef.current) return;
+    const el = prevLayerRef.current;
+    const toX = slideDir.current === "next" ? "-100%" : "100%";
+    el.style.transition = `transform ${SLIDE_DURATION}ms ease-out`;
+    el.style.transform = `translateX(${toX})`;
+    return () => {
+      el.style.transition = "";
+      el.style.transform = "";
+    };
+  }, [prevUrl, slideshowActive]);
+
+  // ─────────────────────────────────────────────────────────────────
+  // Metadata fetch
+  // ─────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!selectedFile) return;
+    commands.getMetadata(selectedFile.path).then(setCurrentMetadata).catch(console.error);
+  }, [selectedFile?.path]);
 
   // Slideshow interval timer
   useEffect(() => {
@@ -163,17 +232,9 @@ export default function Viewer() {
     return () => clearInterval(id);
   }, [slideshowActive, slideshowInterval, selectNext]);
 
-  // ── Metadata ──────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!selectedFile) return;
-    commands.getMetadata(selectedFile.path).then(setCurrentMetadata).catch(console.error);
-  }, [selectedFile?.path]);
-
-  // ── Keyboard shortcuts (zoom / rotate — arrows handled by useKeyboard) ──
-  const zoom = useCallback((delta: number) => {
-    setTransform(t => ({ ...t, scale: Math.max(0.1, Math.min(10, t.scale + delta)) }));
-  }, []);
-
+  // ─────────────────────────────────────────────────────────────────
+  // Keyboard shortcuts
+  // ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).tagName === "INPUT") return;
@@ -182,18 +243,21 @@ export default function Viewer() {
         case "-":           e.preventDefault(); zoom(-0.2); break;
         case "0":           e.preventDefault(); setTransform(DEFAULT_TRANSFORM); break;
         case "r": case "R":
-          if (!e.ctrlKey) { e.preventDefault(); setTransform(t => ({ ...t, rotate: t.rotate + (e.shiftKey ? -90 : 90) })); }
+          if (!e.ctrlKey) { e.preventDefault(); setTransform((t) => ({ ...t, rotate: t.rotate + (e.shiftKey ? -90 : 90) })); }
           break;
-        case "h": e.preventDefault(); setTransform(t => ({ ...t, flipX: !t.flipX })); break;
-        case "v": e.preventDefault(); setTransform(t => ({ ...t, flipY: !t.flipY })); break;
+        case "h": e.preventDefault(); setTransform((t) => ({ ...t, flipX: !t.flipX })); break;
+        case "v": e.preventDefault(); setTransform((t) => ({ ...t, flipY: !t.flipY })); break;
         case "i": case "I": e.preventDefault(); toggleInfoPanel(); break;
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [zoom, toggleInfoPanel]);
+  }, [toggleInfoPanel]);
 
-  // ── Mouse / touch handlers ────────────────────────────────────────
+  const zoom = useCallback((delta: number) => {
+    setTransform((t) => ({ ...t, scale: Math.max(0.1, Math.min(10, t.scale + delta)) }));
+  }, []);
+
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
     if (e.ctrlKey) { zoom(e.deltaY < 0 ? 0.15 : -0.15); return; }
@@ -201,14 +265,14 @@ export default function Viewer() {
   }, [zoom, selectPrev, selectNext]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (e.button !== 0 || slideshowActive) return;
+    if (e.button !== 0 || slideshowActive || isSliding) return;
     setIsDragging(true);
     dragStart.current = { mx: e.clientX, my: e.clientY, tx: transform.x, ty: transform.y };
-  }, [transform, slideshowActive]);
+  }, [transform, slideshowActive, isSliding]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     if (!isDragging || !dragStart.current) return;
-    setTransform(t => ({
+    setTransform((t) => ({
       ...t,
       x: dragStart.current!.tx + e.clientX - dragStart.current!.mx,
       y: dragStart.current!.ty + e.clientY - dragStart.current!.my,
@@ -224,11 +288,13 @@ export default function Viewer() {
     return <div className="flex items-center justify-center h-full text-[#757575]">ファイルが選択されていません</div>;
   }
 
-  // ── Render ────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────
+  // Render
+  // ─────────────────────────────────────────────────────────────────
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full bg-[#111] overflow-hidden select-none"
+      className="relative w-full h-full flex items-center justify-center bg-[#111] overflow-hidden select-none"
       onWheel={handleWheel}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
@@ -238,32 +304,33 @@ export default function Viewer() {
       {slideshowActive ? (
         /* ── Slideshow mode ──────────────────────────────────────── */
         <>
-          {sfCurrentUrl && (
-            <img src={sfCurrentUrl} aria-hidden draggable={false} style={{
+          {/* Current: blurred backdrop */}
+          {currentUrl && (
+            <img src={currentUrl} aria-hidden draggable={false} style={{
               position: "absolute", inset: 0, width: "100%", height: "100%",
               objectFit: "cover", filter: "blur(28px) brightness(0.4)",
               transform: "scale(1.08)", pointerEvents: "none", zIndex: 0,
             }} />
           )}
-          <div className="absolute inset-0 flex items-center justify-center" style={{ zIndex: 2 }}>
-            <img ref={sfImgRef} src={sfCurrentUrl ?? undefined} alt={selectedFile.name} draggable={false}
-              style={{
-                maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
-                transformOrigin: "center center", cursor: "default", willChange: "transform",
-                transform: kbMoveRef.current[0].transform as string,
-              }}
-            />
-          </div>
-          {sfPrevUrl && (
-            <div ref={sfPrevLayerRef} style={{
+          {/* Current: main image with Ken Burns */}
+          <img ref={imgRef} src={currentUrl ?? undefined} alt={selectedFile.name} draggable={false} style={{
+            position: "relative", zIndex: 2,
+            maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
+            transformOrigin: "center center", cursor: "default", willChange: "transform",
+            transform: kbMoveRef.current[0].transform as string, // initial KB position (no flash)
+          }} />
+
+          {/* Previous layer: fades out on top */}
+          {prevUrl && (
+            <div ref={prevLayerRef} style={{
               position: "absolute", inset: 0, zIndex: 5, pointerEvents: "none",
               display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden",
             }}>
-              <img src={sfPrevUrl} aria-hidden draggable={false} style={{
+              <img src={prevUrl} aria-hidden draggable={false} style={{
                 position: "absolute", inset: 0, width: "100%", height: "100%",
                 objectFit: "cover", filter: "blur(28px) brightness(0.4)", transform: "scale(1.08)",
               }} />
-              <img src={sfPrevUrl} draggable={false} style={{
+              <img src={prevUrl} draggable={false} style={{
                 position: "relative", maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
                 transformOrigin: "center center", transform: kbExitTransform.current,
               }} />
@@ -271,62 +338,79 @@ export default function Viewer() {
           )}
         </>
       ) : (
-        /* ── Normal viewer: single image with slide-in animation ─── */
-        <div
-          ref={wrapperRef}
-          style={{
-            position: "absolute", inset: 0,
+        /* ── Normal viewer mode ──────────────────────────────────── */
+        <>
+          {/* Previous image: slides out */}
+          {prevUrl && (
+            <div ref={prevLayerRef} style={{
+              position: "absolute", inset: 0, zIndex: 1, pointerEvents: "none",
+              display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden",
+            }}>
+              <img src={prevUrl} draggable={false} style={{
+                maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
+              }} />
+            </div>
+          )}
+
+          {/* Wrapper div slides in; img inside handles zoom/pan independently */}
+          <div ref={slideInWrapperRef} style={{
+            position: "absolute", inset: 0, zIndex: 2,
             display: "flex", alignItems: "center", justifyContent: "center",
-          }}
-        >
-          {currentUrl && (
+          }}>
             <img
-              src={currentUrl}
+              ref={imgRef}
+              src={currentUrl ?? undefined}
               alt={selectedFile.name}
               draggable={false}
               style={{
-                maxWidth: "100%",
-                maxHeight: "100%",
-                objectFit: "contain",
-                cursor: isDragging ? "grabbing" : "grab",
                 transform: cssTransform,
-                transformOrigin: "center center",
+                cursor: isDragging ? "grabbing" : "grab",
+                maxWidth: transform.scale === 1 ? "100%" : "none",
+                maxHeight: transform.scale === 1 ? "100%" : "none",
+                objectFit: "contain",
                 transition: isDragging ? "none" : "transform 0.05s",
               }}
             />
-          )}
-        </div>
+          </div>
+        </>
       )}
 
       <ViewerControls
-        onPrev={selectPrev}
-        onNext={selectNext}
-        onClose={closeViewer}
-        onZoomIn={() => zoom(0.2)}
-        onZoomOut={() => zoom(-0.2)}
+        onPrev={selectPrev} onNext={selectNext} onClose={closeViewer}
+        onZoomIn={() => zoom(0.2)} onZoomOut={() => zoom(-0.2)}
         onReset={() => setTransform(DEFAULT_TRANSFORM)}
-        onRotate={() => setTransform(t => ({ ...t, rotate: t.rotate + 90 }))}
-        onFlipH={() => setTransform(t => ({ ...t, flipX: !t.flipX }))}
+        onRotate={() => setTransform((t) => ({ ...t, rotate: t.rotate + 90 }))}
+        onFlipH={() => setTransform((t) => ({ ...t, flipX: !t.flipX }))}
         onFullscreen={() => setFullscreen(!isFullscreen)}
-        isFullscreen={isFullscreen}
-        scale={transform.scale}
-        fileName={selectedFile.name}
-        slideshowActive={slideshowActive}
+        onParallax={() => setShowParallax(true)}
+        isFullscreen={isFullscreen} scale={transform.scale}
+        fileName={selectedFile.name} slideshowActive={slideshowActive}
+        isImage={selectedFile.fileType === "image"}
       />
+
+      {showParallax && selectedFile.fileType === "image" && (
+        <ParallaxViewer
+          imagePath={selectedFile.path}
+          onClose={() => setShowParallax(false)}
+        />
+      )}
     </div>
   );
 }
 
-// ─── Controls ─────────────────────────────────────────────────────────
+// ── Controls ──────────────────────────────────────────────────────────
 interface ControlsProps {
   onPrev: () => void; onNext: () => void; onClose: () => void;
   onZoomIn: () => void; onZoomOut: () => void; onReset: () => void;
   onRotate: () => void; onFlipH: () => void; onFullscreen: () => void;
-  isFullscreen: boolean; scale: number; fileName: string; slideshowActive: boolean;
+  onParallax: () => void;
+  isFullscreen: boolean; scale: number; fileName: string;
+  slideshowActive: boolean; isImage: boolean;
 }
 
 function ViewerControls({ onPrev, onNext, onClose, onZoomIn, onZoomOut, onReset,
-    onRotate, onFlipH, onFullscreen, isFullscreen, scale, fileName, slideshowActive }: ControlsProps) {
+    onRotate, onFlipH, onFullscreen, onParallax,
+    isFullscreen, scale, fileName, slideshowActive, isImage }: ControlsProps) {
   return (
     <>
       <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-4 py-2 bg-gradient-to-b from-black/60 to-transparent pointer-events-none" style={{ zIndex: 10 }}>
@@ -340,6 +424,9 @@ function ViewerControls({ onPrev, onNext, onClose, onZoomIn, onZoomOut, onReset,
               <CtrlBtn onClick={onReset} title="リセット (0)">⊞</CtrlBtn>
               <CtrlBtn onClick={onRotate} title="回転 (R)">↻</CtrlBtn>
               <CtrlBtn onClick={onFlipH} title="左右反転 (H)">⇆</CtrlBtn>
+              {isImage && (
+                <CtrlBtn onClick={onParallax} title="パララックス効果">🌊</CtrlBtn>
+              )}
             </>
           )}
           <CtrlBtn onClick={onFullscreen} title="フルスクリーン (F)">{isFullscreen ? "⊠" : "⊡"}</CtrlBtn>

@@ -296,7 +296,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   // ── Slideshow ───────────────────────────────────────────────────
   slideshowActive: false,
-  slideshowInterval: 3,
+  slideshowInterval: 10,
   toggleSlideshow: () => set((s) => ({ slideshowActive: !s.slideshowActive })),
   startSlideshow: () => {
     const { files, checkedFileIds } = get();

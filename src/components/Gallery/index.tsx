@@ -18,10 +18,7 @@ function useThumbnail(path: string, enabled: boolean, onFail?: () => void) {
       .getThumbnail(path)
       .then((b64) => { if (!cancelled) setSrc(`data:image/jpeg;base64,${b64}`); })
       .catch(() => {
-        if (!cancelled) {
-          setSrc(null);
-          onFail?.();
-        }
+        if (!cancelled) { setSrc(null); onFail?.(); }
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };

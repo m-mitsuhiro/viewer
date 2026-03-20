@@ -1,0 +1,4 @@
+[build]
+# Limit parallel jobs to reduce memory usage during compilation
+# Increase this if you have plenty of RAM (16GB+)
+jobs = 4
