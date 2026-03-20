@@ -3,8 +3,22 @@ import { pipeline, env } from "@huggingface/transformers";
 // Use remote models only (no local model lookup)
 env.allowLocalModels = false;
 
+const MODEL = "onnx-community/depth-anything-v2-small";
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let estimator: any = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const progressCallback = (info: any) => {
+  if (info.status === "downloading" || info.status === "progress") {
+    self.postMessage({
+      type: "progress",
+      name: info.name ?? "",
+      loaded: info.loaded ?? 0,
+      total: info.total ?? 0,
+    });
+  }
+};
 
 self.addEventListener("message", async (event: MessageEvent) => {
   const { type, imageDataUrl } = event.data;
@@ -13,23 +27,16 @@ self.addEventListener("message", async (event: MessageEvent) => {
   try {
     if (!estimator) {
       self.postMessage({ type: "status", message: "モデルを読み込み中..." });
-      estimator = await pipeline(
-        "depth-estimation",
-        "Xenova/depth-anything-small-hf",
-        {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          progress_callback: (info: any) => {
-            if (info.status === "downloading" || info.status === "progress") {
-              self.postMessage({
-                type: "progress",
-                name: info.name ?? "",
-                loaded: info.loaded ?? 0,
-                total: info.total ?? 0,
-              });
-            }
-          },
-        }
-      );
+      // WebGPUで試行し、非対応環境ではCPUにフォールバック
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const opts = (device: string) => ({ device, progress_callback: progressCallback } as any);
+      try {
+        estimator = await pipeline("depth-estimation", MODEL, opts("webgpu"));
+      } catch {
+        self.postMessage({ type: "status", message: "モデルを読み込み中（WASM）..." });
+        estimator = await pipeline("depth-estimation", MODEL, opts("wasm"));
+      }
     }
 
     self.postMessage({ type: "status", message: "深度推定を実行中..." });

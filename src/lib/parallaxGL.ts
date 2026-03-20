@@ -15,9 +15,16 @@ uniform sampler2D u_image;
 uniform sampler2D u_depth;
 uniform vec2 u_shift;
 uniform float u_zoom;
+uniform vec2 u_depthTexelSize;
 void main() {
   vec2 uv = (v_uv - 0.5) / u_zoom + 0.5;
-  float depth = texture2D(u_depth, uv).r;
+  // 5-tap minimum depth: reduces foreground smear at depth discontinuities
+  float d0 = texture2D(u_depth, uv).r;
+  float d1 = texture2D(u_depth, uv + vec2( u_depthTexelSize.x, 0.0)).r;
+  float d2 = texture2D(u_depth, uv + vec2(-u_depthTexelSize.x, 0.0)).r;
+  float d3 = texture2D(u_depth, uv + vec2(0.0,  u_depthTexelSize.y)).r;
+  float d4 = texture2D(u_depth, uv + vec2(0.0, -u_depthTexelSize.y)).r;
+  float depth = min(d0, min(min(d1, d2), min(d3, d4)));
   vec2 displaced = uv - u_shift * depth;
   gl_FragColor = texture2D(u_image, displaced);
 }`;
@@ -69,18 +76,30 @@ export function uploadDepthTexture(
   w: number,
   h: number
 ): WebGLTexture {
-  const uint8 = new Uint8Array(data.length * 4);
-  for (let i = 0; i < data.length; i++) {
-    const v = Math.round(data[i] * 255);
-    uint8[i * 4] = v; uint8[i * 4 + 1] = v; uint8[i * 4 + 2] = v; uint8[i * 4 + 3] = 255;
-  }
   const tex = gl.createTexture()!;
   gl.activeTexture(gl.TEXTURE0 + unit);
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, uint8);
+
+  // Try OES_texture_float for full float32 precision (no banding)
+  const extFloat = gl.getExtension("OES_texture_float");
+  const extLinear = gl.getExtension("OES_texture_float_linear");
+  const filter = extLinear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+
+  if (extFloat) {
+    // LUMINANCE+FLOAT: shader reads .r directly as float
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, w, h, 0, gl.LUMINANCE, gl.FLOAT, data);
+  } else {
+    // Fallback: quantize to 8-bit RGBA
+    const uint8 = new Uint8Array(data.length * 4);
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.round(data[i] * 255);
+      uint8[i * 4] = v; uint8[i * 4 + 1] = v; uint8[i * 4 + 2] = v; uint8[i * 4 + 3] = 255;
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, uint8);
+  }
   return tex;
 }

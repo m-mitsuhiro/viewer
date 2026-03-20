@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { getCachedDepth, setCachedDepth } from "../../lib/depthCache";
 
 // ── WebGL shader sources ───────────────────────────────────────────────────
 const VERT_SRC = `
@@ -18,11 +19,16 @@ uniform sampler2D u_image;
 uniform sampler2D u_depth;
 uniform vec2 u_shift;
 uniform float u_zoom;
+uniform vec2 u_depthTexelSize;
 void main() {
-  // Scale toward center by zoom to create padding (hides edge artifacts)
   vec2 uv = (v_uv - 0.5) / u_zoom + 0.5;
-  float depth = texture2D(u_depth, uv).r;
-  // Near objects (depth≈1) shift more; far objects (depth≈0) stay still
+  // 5-tap minimum depth: reduces foreground smear at depth discontinuities
+  float d0 = texture2D(u_depth, uv).r;
+  float d1 = texture2D(u_depth, uv + vec2( u_depthTexelSize.x, 0.0)).r;
+  float d2 = texture2D(u_depth, uv + vec2(-u_depthTexelSize.x, 0.0)).r;
+  float d3 = texture2D(u_depth, uv + vec2(0.0,  u_depthTexelSize.y)).r;
+  float d4 = texture2D(u_depth, uv + vec2(0.0, -u_depthTexelSize.y)).r;
+  float depth = min(d0, min(min(d1, d2), min(d3, d4)));
   vec2 displaced = uv - u_shift * depth;
   gl_FragColor = texture2D(u_image, displaced);
 }`;
@@ -66,22 +72,31 @@ function uploadDepthTexture(
   w: number,
   h: number
 ): WebGLTexture {
-  const uint8 = new Uint8Array(data.length * 4);
-  for (let i = 0; i < data.length; i++) {
-    const v = Math.round(data[i] * 255);
-    uint8[i * 4] = v;
-    uint8[i * 4 + 1] = v;
-    uint8[i * 4 + 2] = v;
-    uint8[i * 4 + 3] = 255;
-  }
   const tex = gl.createTexture()!;
   gl.activeTexture(gl.TEXTURE0 + unit);
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, uint8);
+
+  // Try OES_texture_float for full float32 precision (no banding)
+  const extFloat = gl.getExtension("OES_texture_float");
+  const extLinear = gl.getExtension("OES_texture_float_linear");
+  const filter = extLinear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+
+  if (extFloat) {
+    // LUMINANCE+FLOAT: shader reads .r directly as float
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, w, h, 0, gl.LUMINANCE, gl.FLOAT, data);
+  } else {
+    // Fallback: quantize to 8-bit RGBA
+    const uint8 = new Uint8Array(data.length * 4);
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.round(data[i] * 255);
+      uint8[i * 4] = v; uint8[i * 4 + 1] = v; uint8[i * 4 + 2] = v; uint8[i * 4 + 3] = 255;
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, uint8);
+  }
   return tex;
 }
 
@@ -119,7 +134,7 @@ export default function ParallaxViewer({ imagePath, onClose }: Props) {
 
     (async () => {
       try {
-        // Load image as data URL
+        // Load image as blob URL
         const bytes = await readFile(imagePath);
         const ext = imagePath.split(".").pop()?.toLowerCase() ?? "jpg";
         const mime =
@@ -163,8 +178,21 @@ export default function ParallaxViewer({ imagePath, onClose }: Props) {
         uploadTexture(gl, 0, img);
         gl.uniform1i(gl.getUniformLocation(prog, "u_image"), 0);
 
-        // Convert to data URL for worker (resize to max 512px for speed)
-        const maxDim = 512;
+        // ── Check depth cache first (from slideshow pre-computation) ──────
+        const cached = getCachedDepth(imagePath);
+        if (cached) {
+          if (cancelled) return;
+          uploadDepthTexture(gl, 1, cached.depthMap, cached.width, cached.height);
+          gl.uniform1i(gl.getUniformLocation(prog, "u_depth"), 1);
+          gl.uniform2f(gl.getUniformLocation(prog, "u_depthTexelSize"),
+            1.0 / cached.width, 1.0 / cached.height);
+          setStage("ready");
+          startRenderLoop();
+          return;
+        }
+
+        // ── Not cached: resize to 1024px max and run worker ───────────────
+        const maxDim = 1024;
         const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
         const oc = document.createElement("canvas");
         oc.width = Math.round(img.naturalWidth * scale);
@@ -193,9 +221,14 @@ export default function ParallaxViewer({ imagePath, onClose }: Props) {
                 : 0;
             setStatusMsg(`${e.data.name ?? "モデル"} ダウンロード中... ${pct}%`);
           } else if (type === "result") {
+            const result = { depthMap: depthMap as Float32Array, width, height };
+            // Store in cache for future use
+            setCachedDepth(imagePath, result);
             // Upload depth texture (unit 1)
-            uploadDepthTexture(gl, 1, depthMap as Float32Array, width, height);
+            uploadDepthTexture(gl, 1, result.depthMap, result.width, result.height);
             gl.uniform1i(gl.getUniformLocation(prog!, "u_depth"), 1);
+            gl.uniform2f(gl.getUniformLocation(prog!, "u_depthTexelSize"),
+              1.0 / result.width, 1.0 / result.height);
             setStage("ready");
             startRenderLoop();
           } else if (type === "error") {
@@ -305,7 +338,7 @@ export default function ParallaxViewer({ imagePath, onClose }: Props) {
                 <div className="w-10 h-10 border-4 border-[#333] border-t-[#4a9eff] rounded-full animate-spin" />
                 <p className="text-sm text-[#aaa] text-center max-w-xs">{statusMsg}</p>
                 <p className="text-xs text-[#555]">
-                  初回はモデルのダウンロードが必要です（約50MB）
+                  初回はモデルのダウンロードが必要です（約80MB）
                 </p>
               </>
             )}
