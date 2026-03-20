@@ -48,6 +48,8 @@ pub fn run() {
             commands::files::scan_folder,
             commands::files::get_files,
             commands::files::get_thumbnail,
+            commands::files::get_cached_thumbnail,
+            commands::files::save_thumbnail_cache,
             commands::files::get_metadata,
             commands::files::delete_to_trash,
             commands::files::open_in_explorer,

@@ -107,6 +107,31 @@ pub async fn get_thumbnail(
         .map_err(|e| e.to_string())?
 }
 
+/// Get thumbnail from disk cache only (no generation). Used for video files.
+#[tauri::command]
+pub async fn get_cached_thumbnail(
+    cache: State<'_, ThumbnailCache>,
+    path: String,
+) -> Result<String, String> {
+    let dir = cache.dir.clone();
+    tokio::task::spawn_blocking(move || crate::thumbnail::get_cached(&dir, &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Save a frontend-generated thumbnail (base64 JPEG) to disk cache.
+#[tauri::command]
+pub async fn save_thumbnail_cache(
+    cache: State<'_, ThumbnailCache>,
+    path: String,
+    b64: String,
+) -> Result<(), String> {
+    let dir = cache.dir.clone();
+    tokio::task::spawn_blocking(move || crate::thumbnail::save_to_cache(&dir, &path, &b64))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Get file metadata (EXIF + filesystem info).
 #[tauri::command]
 pub async fn get_metadata(path: String) -> Result<FileMetadata, String> {

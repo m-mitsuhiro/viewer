@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store";
 import { commands } from "../../lib/tauri";
+import ParallaxViewer from "../ParallaxViewer";
 
 type Transform = { scale: number; x: number; y: number; rotate: number; flipX: boolean; flipY: boolean };
 const DEFAULT_TRANSFORM: Transform = { scale: 1, x: 0, y: 0, rotate: 0, flipX: false, flipY: false };
@@ -37,6 +38,9 @@ export default function Viewer() {
     slideshowActive, slideshowInterval, slideDirection,
   } = useAppStore();
 
+  // ── Parallax viewer ──────────────────────────────────────────────
+  const [showParallax, setShowParallax] = useState(false);
+
   // ── Manual transform (zoom / pan / rotate) ───────────────────────
   const [transform, setTransform] = useState<Transform>(DEFAULT_TRANSFORM);
   const [isDragging, setIsDragging] = useState(false);
@@ -58,7 +62,6 @@ export default function Viewer() {
   // ── Normal-viewer slide ──────────────────────────────────────────
   const [isSliding, setIsSliding]     = useState(false);
   const slideDir       = useRef<"prev" | "next">("next"); // captured at load time
-  const slideAnimIn    = useRef<Animation | null>(null);
   const cssTransformRef = useRef<string>("");             // kept in sync for exit capture
 
   // ── DOM refs ─────────────────────────────────────────────────────
@@ -124,7 +127,7 @@ export default function Viewer() {
           if (prevUrlRef.current) { URL.revokeObjectURL(prevUrlRef.current); prevUrlRef.current = null; }
           setPrevUrl(null);
           prevTimer.current = null;
-        }, slideshowActive ? 1100 : SLIDE_DURATION + 100);
+        }, slideshowActive ? 1100 : SLIDE_DURATION + 500);
       })
       .catch(console.error);
 
@@ -175,33 +178,43 @@ export default function Viewer() {
   }, [prevUrl, slideshowActive]);
 
   // ─────────────────────────────────────────────────────────────────
-  // Slide-in animation: animate the wrapper div, not the img
-  // (avoids maxWidth/maxHeight size jump at completion)
+  // Slide-in animation (useLayoutEffect で paint 前に開始 → 確実に動作)
   // ─────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (slideshowActive || !isSliding || !currentUrl || !slideInWrapperRef.current || !prevUrl) return;
-    slideAnimIn.current?.cancel();
+  useLayoutEffect(() => {
+    if (slideshowActive || !isSliding || !currentUrl || !slideInWrapperRef.current) return;
+    const el = slideInWrapperRef.current;
     const fromX = slideDir.current === "next" ? "100%" : "-100%";
-    const anim = slideInWrapperRef.current.animate(
-      [{ transform: `translateX(${fromX})` }, { transform: "translateX(0)" }],
-      { duration: SLIDE_DURATION, easing: "ease-out", fill: "forwards" }
-    );
-    // On finish: just flip isSliding — effect cleanup will cancel the animation
-    anim.addEventListener("finish", () => setIsSliding(false));
-    slideAnimIn.current = anim;
-    return () => { anim.cancel(); };
-  }, [currentUrl, isSliding, slideshowActive, prevUrl]);
+
+    // 開始位置をトランジションなしで設定
+    el.style.transition = "none";
+    el.style.transform = `translateX(${fromX})`;
+    // リフロー強制 → ブラウザが開始位置をコミット
+    void el.offsetWidth;
+    // トランジション開始
+    el.style.transition = `transform ${SLIDE_DURATION}ms ease-out`;
+    el.style.transform = "translateX(0)";
+
+    const done = () => setIsSliding(false);
+    el.addEventListener("transitionend", done, { once: true });
+    return () => {
+      el.removeEventListener("transitionend", done);
+      el.style.transition = "";
+      el.style.transform = "";
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUrl, isSliding, slideshowActive]);
 
   // Slide-out animation for outgoing image (normal viewer)
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (slideshowActive || !prevUrl || !prevLayerRef.current) return;
-    const dir = slideDir.current;
-    const toX = dir === "next" ? "-100%" : "100%";
-    const anim = prevLayerRef.current.animate(
-      [{ transform: "translateX(0)" }, { transform: `translateX(${toX})` }],
-      { duration: SLIDE_DURATION, easing: "ease-out", fill: "forwards" }
-    );
-    return () => anim.cancel();
+    const el = prevLayerRef.current;
+    const toX = slideDir.current === "next" ? "-100%" : "100%";
+    el.style.transition = `transform ${SLIDE_DURATION}ms ease-out`;
+    el.style.transform = `translateX(${toX})`;
+    return () => {
+      el.style.transition = "";
+      el.style.transform = "";
+    };
   }, [prevUrl, slideshowActive]);
 
   // ─────────────────────────────────────────────────────────────────
@@ -343,10 +356,6 @@ export default function Viewer() {
           <div ref={slideInWrapperRef} style={{
             position: "absolute", inset: 0, zIndex: 2,
             display: "flex", alignItems: "center", justifyContent: "center",
-            // Initial off-screen position (Web Animations API overrides immediately after render)
-            transform: isSliding
-              ? `translateX(${slideDir.current === "next" ? "100%" : "-100%"})`
-              : "none",
           }}>
             <img
               ref={imgRef}
@@ -373,9 +382,18 @@ export default function Viewer() {
         onRotate={() => setTransform((t) => ({ ...t, rotate: t.rotate + 90 }))}
         onFlipH={() => setTransform((t) => ({ ...t, flipX: !t.flipX }))}
         onFullscreen={() => setFullscreen(!isFullscreen)}
+        onParallax={() => setShowParallax(true)}
         isFullscreen={isFullscreen} scale={transform.scale}
         fileName={selectedFile.name} slideshowActive={slideshowActive}
+        isImage={selectedFile.fileType === "image"}
       />
+
+      {showParallax && selectedFile.fileType === "image" && (
+        <ParallaxViewer
+          imagePath={selectedFile.path}
+          onClose={() => setShowParallax(false)}
+        />
+      )}
     </div>
   );
 }
@@ -385,11 +403,14 @@ interface ControlsProps {
   onPrev: () => void; onNext: () => void; onClose: () => void;
   onZoomIn: () => void; onZoomOut: () => void; onReset: () => void;
   onRotate: () => void; onFlipH: () => void; onFullscreen: () => void;
-  isFullscreen: boolean; scale: number; fileName: string; slideshowActive: boolean;
+  onParallax: () => void;
+  isFullscreen: boolean; scale: number; fileName: string;
+  slideshowActive: boolean; isImage: boolean;
 }
 
 function ViewerControls({ onPrev, onNext, onClose, onZoomIn, onZoomOut, onReset,
-    onRotate, onFlipH, onFullscreen, isFullscreen, scale, fileName, slideshowActive }: ControlsProps) {
+    onRotate, onFlipH, onFullscreen, onParallax,
+    isFullscreen, scale, fileName, slideshowActive, isImage }: ControlsProps) {
   return (
     <>
       <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-4 py-2 bg-gradient-to-b from-black/60 to-transparent pointer-events-none" style={{ zIndex: 10 }}>
@@ -403,6 +424,9 @@ function ViewerControls({ onPrev, onNext, onClose, onZoomIn, onZoomOut, onReset,
               <CtrlBtn onClick={onReset} title="リセット (0)">⊞</CtrlBtn>
               <CtrlBtn onClick={onRotate} title="回転 (R)">↻</CtrlBtn>
               <CtrlBtn onClick={onFlipH} title="左右反転 (H)">⇆</CtrlBtn>
+              {isImage && (
+                <CtrlBtn onClick={onParallax} title="パララックス効果">🌊</CtrlBtn>
+              )}
             </>
           )}
           <CtrlBtn onClick={onFullscreen} title="フルスクリーン (F)">{isFullscreen ? "⊠" : "⊡"}</CtrlBtn>

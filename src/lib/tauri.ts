@@ -69,6 +69,8 @@ export const commands = {
     }),
 
   getThumbnail: (path: string) => invoke<string>("get_thumbnail", { path }),
+  getCachedThumbnail: (path: string) => invoke<string>("get_cached_thumbnail", { path }),
+  saveThumbnailCache: (path: string, b64: string) => invoke<void>("save_thumbnail_cache", { path, b64 }),
   getMetadata: (path: string) => invoke<FileMetadata>("get_metadata", { path }),
   deleteToTrash: (path: string) => invoke<void>("delete_to_trash", { path }),
   openInExplorer: (path: string) => invoke<void>("open_in_explorer", { path }),
