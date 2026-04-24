@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useAppStore } from "../../store";
 import { useFileUrl } from "../../hooks/useFileUrl";
+import { commands } from "../../lib/tauri";
 
 const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
 
 export default function Player() {
-  const { selectedFile, selectNext, selectPrev, closeViewer, isFullscreen, setFullscreen } =
+  const { selectedFile, selectNext, selectPrev, closeViewer, isFullscreen, setFullscreen, slideshowActive } =
     useAppStore();
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -16,6 +17,8 @@ export default function Player() {
   const [speed, setSpeed] = useState(1);
   const [isLooping, setIsLooping] = useState(false);
   const [showControls, setShowControls] = useState(true);
+  const [savedMessage, setSavedMessage] = useState<string | null>(null);
+  const savedTimer = useRef<number | null>(null);
   const controlsTimer = useRef<number | null>(null);
 
   const src = useFileUrl(selectedFile?.path);
@@ -32,8 +35,17 @@ export default function Player() {
   useEffect(() => {
     return () => {
       if (controlsTimer.current) clearTimeout(controlsTimer.current);
+      if (savedTimer.current) clearTimeout(savedTimer.current);
     };
   }, []);
+
+  // スライドショー中: src が変わったら自動再生
+  useEffect(() => {
+    if (!slideshowActive || !src) return;
+    const v = videoRef.current;
+    if (!v) return;
+    v.play().catch(() => {});
+  }, [slideshowActive, src]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -46,6 +58,40 @@ export default function Player() {
     if (!v) return;
     v.volume = volume;
   }, [volume]);
+
+  const togglePlay = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.paused ? v.play() : v.pause();
+  }, []);
+
+  const FRAME_STEP = 1 / 30;
+
+  const stepFrame = useCallback((dir: 1 | -1) => {
+    const v = videoRef.current;
+    if (!v || !v.paused) return;
+    v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + dir * FRAME_STEP));
+  }, []);
+
+  const captureFrame = useCallback(async () => {
+    const v = videoRef.current;
+    if (!v || !selectedFile) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = v.videoWidth;
+    canvas.height = v.videoHeight;
+    canvas.getContext("2d")!.drawImage(v, 0, 0);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.95);
+    const b64 = dataUrl.split(",")[1];
+    try {
+      const savedPath = await commands.saveFrame(selectedFile.path, b64);
+      const name = savedPath.split(/[\\/]/).pop() ?? savedPath;
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      setSavedMessage(name);
+      savedTimer.current = window.setTimeout(() => setSavedMessage(null), 2000);
+    } catch (e) {
+      console.error("captureFrame failed:", e);
+    }
+  }, [selectedFile]);
 
   // Keyboard shortcuts for player
   useEffect(() => {
@@ -92,11 +138,24 @@ export default function Player() {
           e.preventDefault();
           setIsLooping((l) => !l);
           break;
+        case ",":
+          e.preventDefault();
+          stepFrame(-1);
+          break;
+        case ".":
+          e.preventDefault();
+          stepFrame(1);
+          break;
+        case "s":
+        case "S":
+          e.preventDefault();
+          captureFrame();
+          break;
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectNext, selectPrev]);
+  }, [selectNext, selectPrev, stepFrame, captureFrame]);
 
   if (!selectedFile || !src) {
     return (
@@ -105,12 +164,6 @@ export default function Player() {
       </div>
     );
   }
-
-  const togglePlay = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    v.paused ? v.play() : v.pause();
-  };
 
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
@@ -217,6 +270,8 @@ export default function Player() {
             />
           </div>
 
+          {/* Capture */}
+          <PlayerBtn onClick={captureFrame} title="フレームを保存 (S)">📷</PlayerBtn>
           {/* Fullscreen */}
           <PlayerBtn onClick={() => setFullscreen(!isFullscreen)} title="フルスクリーン (F)">
             {isFullscreen ? "⊠" : "⊡"}
@@ -234,6 +289,13 @@ export default function Player() {
       >
         <span className="text-white/80 text-sm truncate block">{selectedFile.name}</span>
       </div>
+
+      {/* フレームキャプチャ保存フィードバック */}
+      {savedMessage && (
+        <div className="absolute top-12 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded bg-black/70 text-white text-xs pointer-events-none" style={{ zIndex: 20 }}>
+          📷 {savedMessage}
+        </div>
+      )}
     </div>
   );
 }

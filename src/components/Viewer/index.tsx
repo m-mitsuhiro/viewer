@@ -1,11 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { useAppStore } from "../../store";
 import { commands } from "../../lib/tauri";
 import ParallaxViewer from "../ParallaxViewer";
 
 type Transform = { scale: number; x: number; y: number; rotate: number; flipX: boolean; flipY: boolean };
 const DEFAULT_TRANSFORM: Transform = { scale: 1, x: 0, y: 0, rotate: 0, flipX: false, flipY: false };
+
+function safeRevoke(url: string | null) {
+  if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
+}
 
 function getMimeType(path: string) {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -64,8 +69,13 @@ export default function Viewer() {
   const slideDir       = useRef<"prev" | "next">("next"); // captured at load time
   const cssTransformRef = useRef<string>("");             // kept in sync for exit capture
 
+  // ── File type tracking (for URL revoke safety) ───────────────────
+  const currFileTypeRef = useRef<"image" | "video" | null>(null);
+  const prevFileTypeRef = useRef<"image" | "video" | null>(null);
+
   // ── DOM refs ─────────────────────────────────────────────────────
   const imgRef             = useRef<HTMLImageElement>(null);
+  const videoRef           = useRef<HTMLVideoElement>(null);
   const prevLayerRef       = useRef<HTMLDivElement>(null);
   const slideInWrapperRef  = useRef<HTMLDivElement>(null); // slide target (not the img)
 
@@ -91,46 +101,51 @@ export default function Viewer() {
   useEffect(() => {
     if (!selectedFile) return;
     let cancelled = false;
+    const isVideo = selectedFile.fileType === "video";
 
-    readFile(selectedFile.path)
-      .then((data) => {
+    const load = async () => {
+      let newUrl: string;
+      if (isVideo) {
+        newUrl = convertFileSrc(selectedFile.path);
+      } else {
+        const data = await readFile(selectedFile.path);
         if (cancelled) return;
-        const newUrl = URL.createObjectURL(
-          new Blob([data], { type: getMimeType(selectedFile.path) })
-        );
+        newUrl = URL.createObjectURL(new Blob([data], { type: getMimeType(selectedFile.path) }));
+      }
+      if (cancelled) return;
 
-        // Clear pending prev cleanup
-        if (prevTimer.current !== null) { clearTimeout(prevTimer.current); prevTimer.current = null; }
+      // Clear pending prev cleanup
+      if (prevTimer.current !== null) { clearTimeout(prevTimer.current); prevTimer.current = null; }
+      safeRevoke(prevUrlRef.current);
 
-        // Revoke old prev immediately
-        if (prevUrlRef.current) { URL.revokeObjectURL(prevUrlRef.current); }
+      if (slideshowActive) {
+        // Ken Burns: capture exit transform and pre-select next move
+        if (imgRef.current) kbExitTransform.current = window.getComputedStyle(imgRef.current).transform;
+        kbMoveRef.current = KB_MOVES[Math.floor(Math.random() * KB_MOVES.length)];
+      } else {
+        slideDir.current = slideDirection;
+      }
 
-        if (slideshowActive) {
-          // Ken Burns: capture exit transform and pre-select next move
-          if (imgRef.current) kbExitTransform.current = window.getComputedStyle(imgRef.current).transform;
-          kbMoveRef.current = KB_MOVES[Math.floor(Math.random() * KB_MOVES.length)];
-        } else {
-          // Normal viewer: capture current direction
-          slideDir.current = slideDirection;
-        }
+      prevFileTypeRef.current = currFileTypeRef.current;
+      prevUrlRef.current = currUrlRef.current;
+      currUrlRef.current = newUrl;
+      currFileTypeRef.current = isVideo ? "video" : "image";
 
-        prevUrlRef.current = currUrlRef.current;
-        currUrlRef.current = newUrl;
+      const hasPrev = !!prevUrlRef.current;
+      setPrevUrl(prevUrlRef.current);
+      setCurrentUrl(newUrl);
+      if (!slideshowActive && !isVideo) setIsSliding(hasPrev);
 
-        const hasPrev = !!prevUrlRef.current;
-        setPrevUrl(prevUrlRef.current);
-        setCurrentUrl(newUrl);
-        if (!slideshowActive) setIsSliding(hasPrev);
+      // Schedule prev URL cleanup
+      prevTimer.current = window.setTimeout(() => {
+        safeRevoke(prevUrlRef.current);
+        prevUrlRef.current = null;
+        setPrevUrl(null);
+        prevTimer.current = null;
+      }, slideshowActive ? 1100 : SLIDE_DURATION + 500);
+    };
 
-        // Schedule prev URL cleanup
-        prevTimer.current = window.setTimeout(() => {
-          if (prevUrlRef.current) { URL.revokeObjectURL(prevUrlRef.current); prevUrlRef.current = null; }
-          setPrevUrl(null);
-          prevTimer.current = null;
-        }, slideshowActive ? 1100 : SLIDE_DURATION + 500);
-      })
-      .catch(console.error);
-
+    load().catch(console.error);
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedFile?.path, slideshowActive]);
@@ -139,8 +154,8 @@ export default function Viewer() {
   useEffect(() => {
     return () => {
       if (prevTimer.current !== null) clearTimeout(prevTimer.current);
-      if (currUrlRef.current) URL.revokeObjectURL(currUrlRef.current);
-      if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current);
+      safeRevoke(currUrlRef.current);
+      safeRevoke(prevUrlRef.current);
     };
   }, []);
 
@@ -153,10 +168,10 @@ export default function Viewer() {
   }, [slideshowActive]);
 
   // ─────────────────────────────────────────────────────────────────
-  // Ken Burns animation (slideshow only)
+  // Ken Burns animation (slideshow only, images only)
   // ─────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!slideshowActive || !imgRef.current || !currentUrl) return;
+    if (!slideshowActive || !imgRef.current || !currentUrl || selectedFile?.fileType === "video") return;
     kbAnimRef.current?.cancel();
     const [from, to] = kbMoveRef.current;
     kbAnimRef.current = imgRef.current.animate([from, to], {
@@ -225,12 +240,18 @@ export default function Viewer() {
     commands.getMetadata(selectedFile.path).then(setCurrentMetadata).catch(console.error);
   }, [selectedFile?.path]);
 
-  // Slideshow interval timer
+  // Slideshow interval timer (動画のときは onEnded で進むためスキップ)
   useEffect(() => {
-    if (!slideshowActive) return;
+    if (!slideshowActive || selectedFile?.fileType === "video") return;
     const id = setInterval(() => selectNext(), slideshowInterval * 1000);
     return () => clearInterval(id);
-  }, [slideshowActive, slideshowInterval, selectNext]);
+  }, [slideshowActive, slideshowInterval, selectNext, selectedFile?.fileType]);
+
+  // スライドショー中の動画: URL変化 or スライドショー開始時に再生開始
+  useEffect(() => {
+    if (!slideshowActive || selectedFile?.fileType !== "video" || !currentUrl) return;
+    videoRef.current?.play().catch(() => {/* autoplay policy blocked */});
+  }, [slideshowActive, selectedFile?.fileType, currentUrl]);
 
   // ─────────────────────────────────────────────────────────────────
   // Keyboard shortcuts
@@ -304,24 +325,42 @@ export default function Viewer() {
       {slideshowActive ? (
         /* ── Slideshow mode ──────────────────────────────────────── */
         <>
-          {/* Current: blurred backdrop */}
-          {currentUrl && (
-            <img src={currentUrl} aria-hidden draggable={false} style={{
-              position: "absolute", inset: 0, width: "100%", height: "100%",
-              objectFit: "cover", filter: "blur(28px) brightness(0.4)",
-              transform: "scale(1.08)", pointerEvents: "none", zIndex: 0,
-            }} />
+          {selectedFile.fileType === "video" ? (
+            /* 動画: autoPlay、再生終了で次へ */
+            <video
+              ref={videoRef}
+              key={currentUrl}
+              src={currentUrl ?? undefined}
+              autoPlay
+              muted
+              style={{
+                position: "relative", zIndex: 2,
+                maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
+              }}
+              onEnded={selectNext}
+            />
+          ) : (
+            <>
+              {/* Current: blurred backdrop */}
+              {currentUrl && (
+                <img src={currentUrl} aria-hidden draggable={false} style={{
+                  position: "absolute", inset: 0, width: "100%", height: "100%",
+                  objectFit: "cover", filter: "blur(28px) brightness(0.4)",
+                  transform: "scale(1.08)", pointerEvents: "none", zIndex: 0,
+                }} />
+              )}
+              {/* Current: main image with Ken Burns */}
+              <img ref={imgRef} src={currentUrl ?? undefined} alt={selectedFile.name} draggable={false} style={{
+                position: "relative", zIndex: 2,
+                maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
+                transformOrigin: "center center", cursor: "default", willChange: "transform",
+                transform: kbMoveRef.current[0].transform as string,
+              }} />
+            </>
           )}
-          {/* Current: main image with Ken Burns */}
-          <img ref={imgRef} src={currentUrl ?? undefined} alt={selectedFile.name} draggable={false} style={{
-            position: "relative", zIndex: 2,
-            maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
-            transformOrigin: "center center", cursor: "default", willChange: "transform",
-            transform: kbMoveRef.current[0].transform as string, // initial KB position (no flash)
-          }} />
 
-          {/* Previous layer: fades out on top */}
-          {prevUrl && (
+          {/* Previous layer: 画像のときのみフェードアウト表示 */}
+          {prevUrl && prevFileTypeRef.current === "image" && (
             <div ref={prevLayerRef} style={{
               position: "absolute", inset: 0, zIndex: 5, pointerEvents: "none",
               display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden",

@@ -53,6 +53,7 @@ pub fn run() {
             commands::files::get_metadata,
             commands::files::delete_to_trash,
             commands::files::open_in_explorer,
+            commands::files::save_frame,
             commands::tags::get_all_tags,
             commands::tags::get_file_tags,
             commands::tags::add_tag,

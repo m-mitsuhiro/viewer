@@ -148,6 +148,41 @@ pub async fn delete_to_trash(path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Save a video frame (base64 JPEG) as an image file next to the video.
+/// Returns the absolute path of the saved file.
+#[tauri::command]
+pub async fn save_frame(video_path: String, jpeg_b64: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        use base64::Engine as _;
+        use chrono::Local;
+        use std::path::Path;
+
+        let video_path = Path::new(&video_path);
+        let parent = video_path.parent().ok_or("invalid video path")?;
+        let stem = video_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("frame");
+
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+        let filename = format!("{stem}_{timestamp}.jpg");
+        let out_path = parent.join(&filename);
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&jpeg_b64)
+            .map_err(|e| e.to_string())?;
+
+        std::fs::write(&out_path, bytes).map_err(|e| e.to_string())?;
+
+        out_path
+            .to_str()
+            .ok_or_else(|| "invalid output path".to_string())
+            .map(String::from)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Open file's parent folder in Explorer / Finder.
 #[tauri::command]
 pub async fn open_in_explorer(path: String) -> Result<(), String> {

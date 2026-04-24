@@ -118,6 +118,19 @@
   - [x] HTML5 `<video>` カスタムコントロールバー
   - [x] 再生速度（0.25x〜2x）/ ループ / 音量
   - [x] フルスクリーン / コントロール自動非表示
+- [ ] **5-9** ネイティブ D&D（ギャラリー → 他アプリ）
+  - [ ] `src-tauri/Cargo.toml`: `tauri-plugin-drag = "2"` 追加
+  - [ ] `src-tauri/src/lib.rs`: `.plugin(tauri_plugin_drag::init())` 登録
+  - [ ] `src-tauri/capabilities/default.json`: `"drag:default"` 追加
+  - [ ] `package.json`: `@tauri-apps/plugin-drag` 追加・`npm install`
+  - [ ] `Gallery/index.tsx`: `ThumbnailItem` に `draggable` + `onDragStart` → `startDrag()` 追加
+  - [ ] テスト: `startDrag` が正しいパス配列で呼ばれることを確認（単ファイル / チェック済み複数ファイル）
+- [ ] **5-8** フレームキャプチャ (`components/Player/`, `commands/files.rs`)
+  - [ ] Rust: `save_frame(video_path, jpeg_b64)` コマンド追加 → 動画と同フォルダに `{名前}_{日時}.jpg` 保存
+  - [ ] `src/lib/tauri.ts`: `saveFrame` バインディング追加
+  - [ ] Player: `,` / `.` キーでコマ送り（一時停止中のみ）
+  - [ ] Player: `S` キー / 📷 ボタンでフレームキャプチャ
+  - [ ] Player: 保存完了フィードバック（ファイル名を 2 秒表示）
 - [x] **5-5** 検索・フィルタ (`components/SearchBar/`)
   - [x] ファイル名リアルタイム検索 / 種別フィルタ（全て/画像/動画）
   - [x] 情報パネル開閉ボタン

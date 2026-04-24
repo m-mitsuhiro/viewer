@@ -74,6 +74,8 @@ export const commands = {
   getMetadata: (path: string) => invoke<FileMetadata>("get_metadata", { path }),
   deleteToTrash: (path: string) => invoke<void>("delete_to_trash", { path }),
   openInExplorer: (path: string) => invoke<void>("open_in_explorer", { path }),
+  saveFrame: (videoPath: string, jpegB64: string) =>
+    invoke<string>("save_frame", { videoPath, jpegB64 }),
 
   // Tags
   getAllTags: () => invoke<Tag[]>("get_all_tags"),
